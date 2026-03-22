@@ -10,32 +10,59 @@ const supabase = createClient(
 export async function GET(request: NextRequest) {
   const { searchParams } = new URL(request.url)
   const sn = searchParams.get('SN') || searchParams.get('sn') || ''
-  const stamp = parseInt(searchParams.get('Stamp') || '0')
 
   if (!sn) {
     return new NextResponse('ERROR', { status: 400 })
   }
 
-  // Upsert device as online
-  const { data: device } = await supabase
+  // Check if device already exists
+  const { data: existing } = await supabase
     .from('devices')
-    .upsert(
-      { device_id: sn, status: 'ONLINE', last_seen: new Date().toISOString() },
-      { onConflict: 'device_id', ignoreDuplicates: false }
-    )
     .select('id')
-    .single()
+    .eq('device_id', sn)
+    .maybeSingle()
 
-  // Fetch pending commands for this device
-  const { data: commands } = await supabase
-    .from('device_commands')
-    .select('id, command, params')
-    .eq('device_id', device?.id ?? '')
-    .eq('status', 'PENDING')
-    .order('created_at', { ascending: true })
-    .limit(5)
+  let deviceId: string | null = existing?.id ?? null
 
-  // Mark commands as SENT
+  if (existing) {
+    // Already registered — just update heartbeat
+    await supabase
+      .from('devices')
+      .update({ status: 'ONLINE', last_seen: new Date().toISOString() })
+      .eq('device_id', sn)
+  } else {
+    // Auto-register on first heartbeat — use SN as name (user can rename later)
+    const { data: inserted, error: insertErr } = await supabase
+      .from('devices')
+      .insert({
+        device_id: sn,
+        name: `Device ${sn}`,
+        status: 'ONLINE',
+        last_seen: new Date().toISOString(),
+      })
+      .select('id')
+      .single()
+
+    if (insertErr) {
+      console.error('[cdata] auto-register failed:', insertErr.message)
+    } else {
+      deviceId = inserted?.id ?? null
+      console.log('[cdata] auto-registered device:', sn, deviceId)
+    }
+  }
+
+  // Fetch pending commands
+  const { data: commands } = deviceId
+    ? await supabase
+        .from('device_commands')
+        .select('id, command, params')
+        .eq('device_id', deviceId)
+        .eq('status', 'PENDING')
+        .order('created_at', { ascending: true })
+        .limit(5)
+    : { data: [] }
+
+  // Mark as SENT
   if (commands && commands.length > 0) {
     await supabase
       .from('device_commands')
@@ -43,8 +70,8 @@ export async function GET(request: NextRequest) {
       .in('id', commands.map((c) => c.id))
   }
 
-  const newStamp = Math.floor(Date.now() / 1000)
-  const body = buildHeartbeatResponse(newStamp, commands || [])
+  const stamp = Math.floor(Date.now() / 1000)
+  const body = buildHeartbeatResponse(stamp, commands || [])
 
   return new NextResponse(body, {
     status: 200,
@@ -59,40 +86,50 @@ export async function POST(request: NextRequest) {
 
   if (!sn) return new NextResponse('ERROR', { status: 400 })
 
-  // Get device record
-  const { data: device } = await supabase
+  // Auto-register if needed (same logic as GET)
+  const { data: existing } = await supabase
     .from('devices')
     .select('id')
     .eq('device_id', sn)
-    .single()
+    .maybeSingle()
 
-  if (!device) return new NextResponse('ERROR: device not registered', { status: 404 })
+  let deviceId: string | null = existing?.id ?? null
+
+  if (!existing) {
+    const { data: inserted } = await supabase
+      .from('devices')
+      .insert({ device_id: sn, name: `Device ${sn}`, status: 'ONLINE', last_seen: new Date().toISOString() })
+      .select('id')
+      .single()
+    deviceId = inserted?.id ?? null
+  } else {
+    await supabase.from('devices').update({ status: 'ONLINE', last_seen: new Date().toISOString() }).eq('device_id', sn)
+  }
+
+  if (!deviceId) return new NextResponse('ERROR: could not resolve device', { status: 500 })
 
   const body = await request.text()
 
   if (table === 'ATTLOG') {
     const punches = parseAttendanceLogs(body)
-    if (punches.length > 0) {
-      for (const punch of punches) {
-        // Resolve user by employee_code (PIN)
-        const { data: deviceUser } = await supabase
-          .from('device_users')
-          .select('user_id')
-          .eq('device_id', device.id)
-          .eq('device_uid', parseInt(punch.pin) || 0)
-          .single()
+    for (const punch of punches) {
+      const { data: deviceUser } = await supabase
+        .from('device_users')
+        .select('user_id')
+        .eq('device_id', deviceId)
+        .eq('device_uid', parseInt(punch.pin) || 0)
+        .maybeSingle()
 
-        await supabase.from('attendance_logs').insert({
-          device_id: device.id,
-          user_id: deviceUser?.user_id ?? null,
-          device_uid: parseInt(punch.pin) || 0,
-          punch_time: new Date(punch.punch_time).toISOString(),
-          record_type: punch.record_type,
-          verify_mode: punch.verify_mode,
-          raw_data: { pin: punch.pin, workcode: punch.workcode, raw: punch.raw },
-          processed: false,
-        })
-      }
+      await supabase.from('attendance_logs').insert({
+        device_id: deviceId,
+        user_id: deviceUser?.user_id ?? null,
+        device_uid: parseInt(punch.pin) || 0,
+        punch_time: new Date(punch.punch_time).toISOString(),
+        record_type: punch.record_type,
+        verify_mode: punch.verify_mode,
+        raw_data: { pin: punch.pin, workcode: punch.workcode, raw: punch.raw },
+        processed: false,
+      })
     }
     return new NextResponse('OK', { status: 200 })
   }
@@ -100,12 +137,11 @@ export async function POST(request: NextRequest) {
   if (table === 'OPERLOG') {
     const users = parseUserRecords(body)
     for (const u of users) {
-      // Find or create user record
       const { data: existingUser } = await supabase
         .from('users')
         .select('id')
         .eq('employee_code', u.pin)
-        .single()
+        .maybeSingle()
 
       let userId = existingUser?.id
       if (!userId) {
@@ -121,13 +157,7 @@ export async function POST(request: NextRequest) {
         await supabase
           .from('device_users')
           .upsert(
-            {
-              device_id: device.id,
-              user_id: userId,
-              device_uid: parseInt(u.pin) || 0,
-              card_number: u.card || null,
-              last_sync_at: new Date().toISOString(),
-            },
+            { device_id: deviceId, user_id: userId, device_uid: parseInt(u.pin) || 0, card_number: u.card || null, last_sync_at: new Date().toISOString() },
             { onConflict: 'device_id,device_uid' }
           )
       }
@@ -140,23 +170,16 @@ export async function POST(request: NextRequest) {
     for (const tpl of templates) {
       const { data: deviceUser } = await supabase
         .from('device_users')
-        .select('id, user_id')
-        .eq('device_id', device.id)
+        .select('id')
+        .eq('device_id', deviceId)
         .eq('device_uid', parseInt(tpl.pin) || 0)
-        .single()
+        .maybeSingle()
 
       if (deviceUser) {
-        if (table === 'templatev10') {
-          await supabase
-            .from('device_users')
-            .update({ fingerprint_count: parseInt(tpl.finger_id) + 1 })
-            .eq('id', deviceUser.id)
-        } else {
-          await supabase
-            .from('device_users')
-            .update({ face_enrolled: true })
-            .eq('id', deviceUser.id)
-        }
+        await supabase
+          .from('device_users')
+          .update(table === 'templatev10' ? { fingerprint_count: parseInt(tpl.finger_id) + 1 } : { face_enrolled: true })
+          .eq('id', deviceUser.id)
       }
     }
     return new NextResponse('OK', { status: 200 })
